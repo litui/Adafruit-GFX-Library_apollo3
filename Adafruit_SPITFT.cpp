@@ -1011,6 +1011,30 @@ void Adafruit_SPITFT::writePixels(uint16_t *colors, uint32_t len, bool block,
     }
     return;
   }
+#elif defined(ARDUINO_ARCH_APOLLO3)
+  if (connection == TFT_HARD_SPI) {
+    // All transfers to display hardware are big-endian!
+    if (bigEndian) {
+      // The data is already big-endian: ship it out!
+      hwspi._spi->transfer(colors, len * 2);
+    }
+    else {
+      // The colors buffer is little-endian: swap its endian-ness in chunks before sending:
+      #define REVERSAL_BUF_SIZE 240
+      static uint16_t bigEndianData[REVERSAL_BUF_SIZE];
+      uint32_t pixelCount;
+      
+      do {
+        pixelCount = min(REVERSAL_BUF_SIZE, len);
+        for (int i = 0; i < pixelCount; i++) {
+          bigEndianData[i] = __builtin_bswap16(colors[i]);
+        }
+        hwspi._spi->transfer(bigEndianData, pixelCount * 2);
+        len -= pixelCount;
+      } while (len > 0);
+    }
+    return;
+  }
 #elif defined(ARDUINO_NRF52_ADAFRUIT) &&                                       \
     defined(NRF52840_XXAA) // Adafruit nRF52 use SPIM3 DMA at 32Mhz
   if (!bigEndian) {
@@ -1354,6 +1378,48 @@ void Adafruit_SPITFT::writeColor(uint16_t color, uint32_t len) {
         hwspi._spi->write(lo);
       }
     } while (len);
+#elif defined(ARDUINO_ARCH_APOLLO3)
+  // Perform pixel color-writing in large chunks to reduce SPI transfer setup overhead.
+  // The chunks are created in big-endian format so that writePixels() does not have to reverse it.
+  #define PIXEL_COUNT 240     // Speed improvements diminish past this number
+
+  static uint32_t colorData[((PIXEL_COUNT)+1)/2];
+  static uint32_t prev_colorDataLen;    // The number of valid pixels in the colorData array
+
+  color = __builtin_bswap16(color);
+  uint32_t c32 = color * 0x00010001;
+
+  // Optimization: we update as little as possible of the color data for the new color
+  uint32_t pixelCount = min((((PIXEL_COUNT)+1)/2), (len+1)/2);
+
+  // See if we need to rebuild all or part of our colored pixel buffer
+  if (colorData[0] != c32) {
+    // It's a new color: we need to rewrite the pixels from the start
+    for (uint32_t i = 0; i<pixelCount; i++) {
+      colorData[i] = c32;
+    }
+    // Make a note of how many color entries are valid now
+    prev_colorDataLen = pixelCount;
+  }
+  else if (pixelCount > prev_colorDataLen) {
+    // The buffer alread contains some of this color, but not enough.
+    // Extend the buffer to hold the new larger required pixelCount
+    for (uint32_t i = prev_colorDataLen; i<pixelCount; i++) {
+      colorData[i] = c32;
+    }
+    // Make a note of how many color entries are valid now
+    prev_colorDataLen = pixelCount;
+  }
+
+  // Now that the pixel buffer is filled with the appropriate amount of pixels, sent it out.
+  // If the amount to send is larger than the buffer, send it in chunks.
+  // Notify writePixels that the data is already big-endian.
+  while (len) {
+    uint32_t l = min(PIXEL_COUNT,len);
+    writePixels((uint16_t *)colorData, l, true);
+    len -= l;
+  }
+  return;
 #elif defined(ARDUINO_ARCH_RP2040)
     spi_inst_t *pi_spi = hwspi._spi == &SPI ? spi0 : spi1;
     color = __builtin_bswap16(color);
@@ -2113,6 +2179,10 @@ void Adafruit_SPITFT::spiWrite(uint8_t b) {
     AVR_WRITESPI(b);
 #elif defined(ESP8266) || defined(ESP32)
     hwspi._spi->write(b);
+#elif defined(ARDUINO_ARCH_APOLLO3)
+    // Apollo3 hardware SPI transfers must start at a word-aligned address
+    uint32_t buf = b;
+    hwspi._spi->transfer(&buf, 1);
 #elif defined(ARDUINO_ARCH_RP2040)
     spi_inst_t *pi_spi = hwspi._spi == &SPI ? spi0 : spi1;
     spi_write_blocking(pi_spi, &b, 1);
@@ -2170,7 +2240,14 @@ uint8_t Adafruit_SPITFT::spiRead(void) {
   uint8_t b = 0;
   uint16_t w = 0;
   if (connection == TFT_HARD_SPI) {
-    return hwspi._spi->transfer((uint8_t)0);
+    #if defined(ARDUINO_ARCH_APOLLO3)
+      // Apollo3 hardware SPI transfers must start at word-aligned addresses
+      uint32_t buf;
+      hwspi._spi->transfer(&buf, 1);
+      return buf & 0xFF;
+    #else
+      return hwspi._spi->transfer((uint8_t)0);
+    #endif
   } else if (connection == TFT_SOFT_SPI) {
     if (swspi._miso >= 0) {
       for (uint8_t i = 0; i < 8; i++) {
@@ -2422,6 +2499,11 @@ void Adafruit_SPITFT::SPI_WRITE16(uint16_t w) {
     AVR_WRITESPI(w);
 #elif defined(ESP8266) || defined(ESP32)
     hwspi._spi->write16(w);
+#elif defined(ARDUINO_ARCH_APOLLO3)
+    // Apollo3 hardware SPI transfers must start at word-aligned addresses
+    // All transfers to display hardware are big-endian!
+    uint32_t outBuf = __builtin_bswap16(w);
+    hwspi._spi->transfer(&outBuf, 2);
 #elif defined(ARDUINO_ARCH_RP2040)
     spi_inst_t *pi_spi = hwspi._spi == &SPI ? spi0 : spi1;
     w = __builtin_bswap16(w);
@@ -2478,6 +2560,11 @@ void Adafruit_SPITFT::SPI_WRITE32(uint32_t l) {
     AVR_WRITESPI(l);
 #elif defined(ESP8266) || defined(ESP32)
     hwspi._spi->write32(l);
+#elif defined(ARDUINO_ARCH_APOLLO3)
+    // Apollo3 hardware SPI transfers must start at word-aligned addresses
+    // All transfers to display hardware are big-endian!
+    uint32_t outBuf = __builtin_bswap32(l);
+    hwspi._spi->transfer(&outBuf, 4);
 #elif defined(ARDUINO_ARCH_RP2040)
     spi_inst_t *pi_spi = hwspi._spi == &SPI ? spi0 : spi1;
     l = __builtin_bswap32(l);
